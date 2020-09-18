@@ -1,0 +1,395 @@
+@Grab('org.yaml:snakeyaml:1.17')
+import org.yaml.snakeyaml.Yaml
+def call(body) {
+    // evaluate the body block, and collect configuration into the object
+    def pipelineParams = [:]
+    def appData
+    def containerData
+    def sourceBranch
+    body.resolveStrategy = Closure.DELEGATE_FIRST
+    body.delegate = pipelineParams
+    body()
+
+    pipeline {
+        agent none
+        environment {
+            repoUrl = "${pipelineParams.scmUrl}"
+            BUILD_ROCK_SVC_ACC = credentials('build-user')
+            bitbucketParams = "${params.bitbucketParams}"
+        }
+
+        stages {
+            stage('checkout') {
+                agent { label "slave1" }
+                steps {
+                    deleteDir()
+                    script {
+                        def bitBucketData = readJSON text: bitbucketParams
+                        sourceBranch = bitBucketData.sourceBranch
+                        desBranch = bitBucketData.destinationBranch
+                        sourceCommitHash = bitBucketData.sourceCommit
+                        desCommitHash = bitBucketData.mergeCommit
+                        env.PR_STATE = bitBucketData.state
+                        env.REPOSLUG_URL = bitBucketData.repositoryName
+                        currentBuild.description = bitBucketData.title
+
+                        if (env.PR_STATE == 'OPEN') {
+                            env.BRANCH_NAME = sourceBranch
+                            env.commitId = sourceCommitHash
+                        } else {
+                            env.BRANCH_NAME = desBranch
+                            env.commitId = desCommitHash
+                        }
+
+                        checkout([$class                           : 'GitSCM',
+                                  branches                         : [[name: env.commitId]],
+                                  doGenerateSubmoduleConfigurations: true,
+                                  extensions                       : [],
+                                  gitTool                          : 'Default',
+                                  submoduleCfg                     : [],
+                                  userRemoteConfigs                : [[credentialsId: 'conman-private-key',
+                                                                       url          : repoUrl
+                                                                      ]]
+                        ])
+                        appData = readYaml file: 'cicd/app.yaml'
+                        containerData = createContainerFile(appData)
+                        echo "Container Data :: "+ containerData
+                        generateTag()
+                        env.BUILD_ID = sh(returnStdout: true, script: 'cat version_raw_$BUILD_NUMBER').trim()
+                        currentBuild.displayName = env.BUILD_ID
+                        echo "Branch Name :: " + env.BRANCH_NAME
+                        env.pod = appData.pod
+                        env.serviceName = appData.name
+                        bitbucketStatusNotify(buildState: 'INPROGRESS', repoSlug: env.REPOSLUG_URL, commitId: env.commitId)
+                    }
+                }
+            }
+
+            stage('setup') {
+                agent {
+                    kubernetes {
+                        label "${env.JOB_NAME}-slave"
+                        defaultContainer 'jnlp'
+                        yaml containerData
+                    }
+                }
+                stages {
+                    stage('Tests') {
+                        steps {
+                            checkout([$class : 'GitSCM', branches : [[name: env.commitId]],
+                                      doGenerateSubmoduleConfigurations: true,
+                                      userRemoteConfigs                : [[credentialsId: 'conman-private-key',
+                                                                           url          : repoUrl
+                                                                          ]]
+                            ])
+                            sshagent(credentials: ['conman-private-key']) {
+                                sh('git submodule update --init --recursive')
+                            }
+                            script {
+                                if(appData.stages.containsKey('test')) {
+                                    if (appData.stages.containsKey('setup')) {
+                                        for (steps in appData.stages.setup) {
+                                            container(steps.container) {
+                                                echo "Inside Container :: "+steps.container
+                                                for (com in steps.command) {
+                                                    echo "PATH :: $PATH"
+                                                    sh "${com}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (appData.stages.containsKey('test')) {
+                                        container('ubuntu') {
+                                            withEnv(['PATH+JAVA_HOME=/opt/jdk1.8.0_221/bin']) {
+                                                for (com in appData.stages.test.command) {
+                                                    sh "${com}"
+                                                }
+                                                jacoco()
+                                                try {
+                                                    withSonarQubeEnv('Whitewalker') {
+                                                        sh './gradlew --info sonarqube -Dsonar.projectKey=swiggy:${pod}:${REPOSLUG_URL} -Dsonar.projectName=${REPOSLUG_URL} -Dsonar.branch.name=${BRANCH_NAME}'
+                                                    }
+                                                } catch (exception) {
+                                                    echo "Sonar analysis: ${exception}"
+                                                    bitbucketStatusNotify buildState: "FAILED", repoSlug: env.REPOSLUG_URL, commitId: env.commitId, buildDescription: "Sonar Analysis Failed"
+                                                } finally {
+                                                    echo "Done Sonar Analysis"
+                                                }
+                                                timeout(time: 1, unit: 'MINUTES') {
+                                                    def qg
+                                                    retry(2) {
+                                                        qg = waitForQualityGate()
+                                                    }
+                                                    if (qg.status != 'OK') {
+                                                        bitbucketStatusNotify buildState: "FAILED", repoSlug: env.REPOSLUG_URL, commitId: env.commitId, buildDescription: "Sonar Analysis Failed"
+                                                        error "Pipeline aborted due to quality gate failure: ${qg.status}"
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        post {
+                            success {
+                                bitbucketStatusNotify(buildState: 'SUCCESSFUL', repoSlug: env.REPOSLUG_URL, commitId: env.commitId)
+                                junit 'build/test-results/**/*.xml'
+                                script{
+                                    if(env.PR_STATE == 'OPEN'){
+                                        currentBuild.result = 'SUCCESS'
+                                        return
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    stage('Build') {
+                        when {
+                            expression { env.PR_STATE == 'MERGED' }
+                        }
+                        steps {
+                            script {
+                                container('ubuntu') {
+                                    withEnv(['PATH+JAVA_HOME=/opt/jdk1.8.0_221/bin']) {
+                                        sshagent(credentials: ['conman-private-key']) {
+                                            sh('git submodule update --init --recursive')
+                                        }
+                                        if (appData.stages.containsKey("build")) {
+                                            for (com in appData.stages.build.command) {
+                                                sh "${com}"
+                                            }
+                                        }
+                                        if (appData.stages.containsKey("publish")) {
+                                            for (com in appData.stages.publish) {
+                                                createPackage(com)
+                                                sh '''
+                                                    file_name=''' + com.cluser_name + '''_${BUILD_ID}_version.txt
+                                                    echo version:${BUILD_ID} > $file_name
+                                                    echo commit_hash:${commitId} >> $file_name
+                                                    echo repo_name:${REPOSLUG_URL} >> $file_name
+                                                    echo repo_url:${repoUrl} >> $file_name
+                                                    aws s3 --region=ap-southeast-1 $file_name s3://artifacts-deb/versions/$file_name                                                
+                                                '''
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                }
+            }
+
+        }
+    }
+}
+
+def getCommitId() {
+    def gitCommitId = sh(returnStdout: true, script: 'git rev-parse HEAD').trim()
+    return gitCommitId
+}
+
+def generateTag(){
+    sshagent(credentials: ['conman-private-key']) {
+        sh '''#!/bin/bash
+            iterate_version() {
+                current_version=$1
+                # check if the current version is greater than the new version
+                current_major=`echo $current_version | awk -F. '{print $1}'`
+                current_minor=`echo $current_version | awk -F. '{print $2}'`
+                current_patch=`echo $current_version | awk -F. '{print $3}' | cut -d'-' -f1`
+                current_release=`echo $current_version | awk -F. '{print $3}' | cut -d'-' -f3`
+
+                new_major=$current_major
+                new_minor=$current_minor
+                #new_patch=$((current_patch + 1))
+                new_patch=$current_patch
+                
+                if [[ $current_release = *rc* ]]; then
+                    release_number=$(echo $current_release | grep -o -E '[0-9]+')
+                    echo "Release number rc$((release_number + 1))"
+                    new_release_tag="rc$((release_number + 1))"
+                elif [[ $current_release = *final* ]]; then
+                     new_release_tag="rc1"
+                     new_patch=0
+                     new_minor=$((new_minor + 1))
+                else
+                     new_release_tag="rc1"   
+                fi
+                echo "New Release Tag :: ${RELEASE_TYPE}   --- $RELEASE_TYPE"
+                if [ -n "$RELEASE_TYPE" ]
+                then
+                    if [ $RELEASE_TYPE == "RC" ] || [ $RELEASE_TYPE == "HOTFIX" ]; then
+                        git_tag=$new_major.$new_minor.$new_patch-${BUILD_NUMBER}-$new_release_tag
+                    fi    
+                else
+                    git_tag=$new_major.$new_minor.$new_patch-${BUILD_NUMBER}
+                    echo $git_tag > version_raw_$BUILD_NUMBER
+                fi
+                   
+                
+                echo $git_tag > version_$BUILD_NUMBER
+            }
+
+            main() {
+                existing_version=`git ls-remote --tags ${repoUrl} | sort -t '/' -k 3 -V | grep -v "{}" | awk '{print $2}' | awk -F/ '{print $3}' | grep -P \"^((([0-9]+)\\.([0-9]+)\\.([0-9]+)(?:-([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?)(?:\\+([0-9a-zA-Z-]+(?:\\.[0-9a-zA-Z-]+)*))?)$\" | tail -n1`
+                echo $existing_version
+                # if tag exists
+                if [ -n "$existing_version" ]
+                then
+                    iterate_version $existing_version
+                else
+                    echo "0.0.0-${BUILD_NUMBER}" > version_raw_$BUILD_NUMBER
+                    echo "0.0.0-${BUILD_NUMBER}-rc1" > version_$BUILD_NUMBER
+                fi
+            }
+            main
+        '''
+    }
+}
+
+def createPackage(Map microService){
+    archiveArtifacts artifacts: microService.dist_path + '/' + microService.dist_id + '.jar', fingerprint: true
+    parallel(
+            "deb": {
+                stage('deb') {
+                    if(microService.containsKey('deb_package') && microService.deb_package == true) {
+                        dir('deb-template') {
+                            deleteDir()
+                            git branch: 'docker', credentialsId: 'conman-private-key', url: 'git@bitbucket.org:swigy/debian-ci-templates.git'
+                        }
+                        sshagent(credentials: ['conman-private-key']) {
+                            sh '''#!/bin/bash
+                                    updateFilenames() {
+                                        sed -i \"s/service_name/$1/g\" $2
+                                    }
+                                    updateVersion() {
+                                        sed -i \"s/version_number/$1/g\" $2
+                                    }
+                                    updatePodTag() {
+                                        if [ $pod != pod ]
+                                        then
+                                            sed -i \"s/pod_name/${pod}/g\" $1
+                                        else
+                                            pod=`curl -s http://consul.swiggyops.de/v1/catalog/service/${microService.name} | jq -r '.[0].ServiceTags[0]' | cut -d '=' -f2`
+                                            if [ $pod != null ]
+                                            then
+                                                sed -i \"s/pod_name/${pod}/g\" $1
+                                            else
+                                                echo "Please specify a pod tag in your build job"
+                                                exit 1
+                                            fi
+                                        fi
+                                    }
+                                    if [ -f "deb-template/custom-templates/''' + microService.cluser_name + '''/opt/SumoCollector/config/sources.json" ]
+                                    then
+                                        mv  deb-template/custom-templates/''' + microService.cluser_name + '''/opt/SumoCollector/config/sources.json deb-template/java-deb/opt/SumoCollector/config/sources.json
+                                    fi
+    
+                                    echo "Service Name ::     :: ''' + microService.cluser_name + '''"
+                                    updatePodTag  "deb-template/java-deb/opt/SumoCollector/config/sources.json"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/DEBIAN/control"
+                                    updateVersion ${BUILD_ID} "deb-template/java-deb/DEBIAN/control"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/DEBIAN/postinst"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/etc/init.d/service_name.sh"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/etc/filebeat/filebeat.yml"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/etc/supervisor/conf.d/service.conf"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/etc/logrotate.d/service"
+                                    updateFilenames ''' + microService.cluser_name + ''' "deb-template/java-deb/opt/SumoCollector/config/sources.json"
+                                    mv deb-template/java-deb/etc/logrotate.d/service deb-template/java-deb/etc/logrotate.d/''' + microService.cluser_name + '''
+                                    mv deb-template/java-deb/etc/init.d/service_name.sh deb-template/java-deb/etc/init.d/''' + microService.cluser_name + '''.sh
+                                    mkdir -p deb-template/java-deb/etc/''' + microService.cluser_name + '''/
+                                    mkdir -p deb-template/java-deb/opt/''' + microService.cluser_name + '''/
+                                    mkdir -p deb-template/java-deb/var/log/''' + microService.cluser_name + '''/
+                                    cp -p ''' + microService.dist_path + '''/''' + microService.dist_id + '''.jar deb-template/java-deb/opt/''' + microService.cluser_name + '''/artifact-''' + microService.cluser_name + '''.jar
+                                    chmod 755 deb-template/java-deb/DEBIAN
+                                    chmod 755 deb-template/java-deb/DEBIAN/postinst
+                                    dpkg-deb --build deb-template/java-deb/ .
+                                    sudo deb-s3 upload --lock --preserve-versions --bucket artifacts-deb *.deb --visibility=private --s3-region=ap-southeast-1
+                                    #sudo deb-s3 upload --lock --preserve-versions --bucket artifacts-deb-v2 *.deb --visibility=private --s3-region=ap-southeast-1
+                                '''
+                        }
+                    }else{
+                        echo "Not creating Debian Package as its not mentioned in app.yaml"
+                    }
+                }
+            },
+            "rock": {
+                stage('harbor') {
+                    if (microService.containsKey('docker_image') && microService.docker_image == true) {
+                        echo "pushing Docker Image"
+                        sh '''#!/bin/bash
+                                if [ $pod != pod ]
+                                then
+                                    echo "pod is ${pod}"
+                                else
+                                    pod=`curl -s http://consul.swiggyops.de/v1/catalog/service/''' + microService.cluser_name + ''' | jq -r '.[0].ServiceTags[0]' | cut -d '=' -f2`
+                                    echo "pod is ${pod}"
+                                fi
+                                if [ $pod != null ]
+                                then
+                                    docker login -u ${BUILD_ROCK_SVC_ACC_USR} -p ${BUILD_ROCK_SVC_ACC_PSW} harbor.rock.swiggy
+                                    docker build -t ${pod}/''' + microService.cluser_name + ''':${BUILD_ID} -f ''' + microService.docker_file_path + ''' .
+                                    docker tag  ${pod}/''' + microService.cluser_name + ''':${BUILD_ID} harbor.rock.swiggy/${pod}/''' + microService.cluser_name + ''':${BUILD_ID}
+                                    docker tag  ${pod}/''' + microService.cluser_name + ''':${BUILD_ID} harbor.rock.swiggy/${pod}/''' + microService.cluser_name + ''':latest
+                                    docker push harbor.rock.swiggy/${pod}/''' + microService.cluser_name + ''':${BUILD_ID}
+                                else
+                                    echo "Please specify a pod tag in your build job"
+                                    exit 1
+                                fi
+                            '''
+                    } else {
+                        echo "Not creating docker image as its not mentioned in app.yaml"
+                    }
+                }
+            }
+    )
+}
+
+def createContainerFile(def configs) {
+    sh("aws s3 cp s3://artifacts-deb/versions/containers.yaml /tmp/containers.yaml")
+    def types = readYaml file: '/tmp/containers.yaml'
+    def containerLists = []
+    def map = configs.containers
+    map.put
+    for (entry in map) {
+        def containerConfig = types.types.get(entry.key)
+        def version
+        def value = entry.value
+        if(value.containsKey("env")){
+            containerConfig.put("env", value.env)
+        }
+        def image = containerConfig.get("image")
+        def newImage
+        for (x in image.split(":")) {
+            newImage = x
+            break
+        }
+
+        if(value.containsKey("version")){
+            version = value.version
+        }else{
+            version = 'latest'
+        }
+
+        containerConfig.put("image", newImage + ":" + version)
+        containerLists.add(containerConfig)
+    }
+    containerLists.add(types.types.get('ubuntu'))
+    def containerMap
+    if(null != types.volumes){
+        containerMap = [volumes: types.volumes, containers: containerLists]
+    }else{
+        containerMap = [containers: containerLists]
+    }
+    LinkedHashMap finalMap = [apiVersion: "v1", kind: "Pod", "spec": containerMap]
+    StringWriter writer = new StringWriter()
+    Yaml yaml = new Yaml()
+    yaml.dump(finalMap, writer)
+    echo "Final Container JSON :: "+ writer.toString()
+    return writer.toString()
+}
+
